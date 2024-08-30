@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestRegressor
 import heapq
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import random
 
 
 def load_data(path):
@@ -91,123 +92,147 @@ def explore_surrounding_points(gpr_model, input_point, search_radius, num_points
     return explore_surrounding_points
 
 
+def generate_random_point(data):
+    min_easting = data['mean_utm_easting'].min()
+    max_easting = data['mean_utm_easting'].max()
+    min_northing = data['mean_utm_northing'].min()
+    max_northing = data['mean_utm_northing'].max()
+    min_depth = data['mean_depth'].min()
+    max_depth = data['mean_depth'].max()
+
+    random_easting = random.uniform(min_easting, max_easting)
+    random_northing = random.uniform(min_northing, max_northing)
+    random_depth = random.uniform(min_depth, max_depth)
+
+    return [random_easting, random_northing, random_depth]
+
+
+def get_voxel_indices(point, voxel_size, voxel_size_z):
+    x_index = int(point[0] // voxel_size)
+    y_index = int(point[1] // voxel_size)
+    z_index = int(point[2] // voxel_size_z)
+    return (x_index, y_index, z_index)
+
+
 def decide_next_move(current_point, prediction_model, correlation_model, depth_prediction_model, visited, threshold,
-                     explore_surrounding_points, heap):
-    print(f"Deciding next move from point: {current_point}")
+                     heap, data, voxel_size=100, voxel_size_z=5):
+    print(f"Moving to : {current_point}")
+    visited.add(tuple(current_point))
 
-    if tuple(current_point) not in visited:
-        visited.add(tuple(current_point))
-        print(f"added the point {current_point} to the visiting set")
+    current_voxel = get_voxel_indices(current_point, voxel_size, voxel_size_z)
 
-        if current_point[2] == 0:  # At the top
-            print("Exploring from the surface.")
-            # Explore the surrounding points
-            new_points = explore_surrounding_points(prediction_model, current_point, search_radius=1000, num_points=100,
-                                                    threshold=threshold)
-            print("these are the potential candidates observed in the surrounding:")
-            print(new_points)
-            print("\n")
+    if current_point[2] == 0:
+        next_point = explore_from_surface(current_point, prediction_model, correlation_model, depth_prediction_model,
+                                          visited, threshold, heap)
+    else:
+        next_point = explore_from_bottom(current_point, prediction_model, visited, threshold, heap)
 
-            for point in new_points:
-                if tuple(point) not in visited:
-                    predicted_value, uncertainty = prediction_model.predict([point[:3]], return_std=True)
-                    distance_cost = calculate_distance_cost(current_point, point)
-                    coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + len(new_points))
-                    importance = importance_score(predicted_value, uncertainty, threshold)
-                    objective_value = objective_function(importance, distance_cost, coverage_factor)
-                    heapq.heappush(heap, (-objective_value, tuple(point)))
-                    print(
-                        f"Added a point from the surrounding top point to heap point {point} with objective value: {objective_value}")
+    # Voxel-based Proximity Check
+    if next_point:
+        next_voxel = get_voxel_indices(next_point, voxel_size, voxel_size_z)
 
-            # Check correlation to decide on going to the bottom
-            predicted_bottom_count = correlation_model.predict([current_point])[0]
-            print(f"Predicted bottom particle count: {predicted_bottom_count}")
+        # If the next point is in the same voxel, choose a different point
+        if current_voxel == next_voxel:
+            print(
+                f"Next point {next_point} is within the same voxel as the current point {current_point}. Exploring randomly.")
+            next_point = explore_randomly(data, heap)
 
-            if predicted_bottom_count >= threshold:
-                predicted_depth = depth_prediction_model.predict([current_point[:2]])[0]
-                point_at_bottom = [current_point[0], current_point[1], predicted_depth]
-                predicted_value, uncertainty = prediction_model.predict([point_at_bottom], return_std=True)
-                importance = importance_score(predicted_value, uncertainty, threshold)
-                distance_cost = calculate_distance_cost(current_point, point_at_bottom)
-                coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + 1)
-                objective_value_at_bottom = objective_function(importance, distance_cost, coverage_factor)
-                heapq.heappush(heap, (-objective_value_at_bottom, tuple(point_at_bottom)))
-                print(
-                    f"Added to the heap bottom point {point_at_bottom} with objective value: {objective_value_at_bottom}")
-
-                if heap and -heap[0][0] > objective_value_at_bottom:
-                    next_move = heapq.heappop(heap)[1]
-                else:
-                    next_move = point_at_bottom
-
-                update_tracking(current_point, heap)
-                return next_move
-
-        else:  # At the bottom
-            print("Exploring from the bottom.")
-            # Explore surrounding points at the bottom
-            new_points = explore_surrounding_points(prediction_model, current_point, search_radius=1000, num_points=100,
-                                                    threshold=threshold)
-            print("these are the potential neighbours of the bottom")
-            print(new_points)
-
-            for point in new_points:
-                if tuple(point) not in visited:
-                    predicted_value, uncertainty = prediction_model.predict([point[:3]], return_std=True)
-                    distance_cost = calculate_distance_cost(current_point, point)
-                    coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + len(new_points))
-                    importance = importance_score(predicted_value, uncertainty, threshold)
-                    objective_value = objective_function(importance, distance_cost, coverage_factor)
-                    heapq.heappush(heap, (-objective_value, tuple(point)))
-                    print(f"Added to heap point {point} with objective value: {objective_value}")
-
-            # Move back to the top at the current lat/long
-            point_at_top = [current_point[0], current_point[1], 0]
-            if tuple(point_at_top) not in visited:
-                predicted_value, uncertainty = prediction_model.predict([point_at_top], return_std=True)
-                importance = importance_score(predicted_value, uncertainty, threshold)
-                distance_cost = calculate_distance_cost(current_point, point_at_top)
-                coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + 1)
-                objective_value_at_top = objective_function(importance, distance_cost, coverage_factor)
-                heapq.heappush(heap, (-objective_value_at_top, tuple(point_at_top)))
-                print(f"Added to the heap top point {point_at_top} with objective value: {objective_value_at_top}")
-
-                if heap and -heap[0][0] > objective_value_at_top:
-                    next_move = heapq.heappop(heap)[1]
-                else:
-                    next_move = point_at_top
-
-                update_tracking(current_point, heap)
-                return next_move
-
-            # If neither move to top nor surrounding is better, check neighbors of top not visited
-            print("both the neighbours of the bottom and the top points are low we are checking nei of top")
-            surrounding_top_points = explore_surrounding_points(prediction_model, point_at_top, search_radius=1000,
-                                                                num_points=100, threshold=threshold)
-            for point in surrounding_top_points:
-                if tuple(point) not in visited:
-                    predicted_value, uncertainty = prediction_model.predict([point[:3]], return_std=True)
-                    distance_cost = calculate_distance_cost(current_point, point)
-                    coverage_factor = calculate_coverage_factor(visited,
-                                                                total_area=len(visited) + len(surrounding_top_points))
-                    importance = importance_score(predicted_value, uncertainty, threshold)
-                    objective_value = objective_function(importance, distance_cost, coverage_factor)
-                    heapq.heappush(heap, (-objective_value, tuple(point)))
-                    print(f"Added to heap surrounding top point {point} with objective value: {objective_value}")
-
-            if heap:
-                next_move = heapq.heappop(heap)[1]
-            else:
-                next_move = None
-
-            update_tracking(current_point, heap)
-            return next_move
-
-    print("No valid moves found.")
-    return None
+    return next_point
 
 
-def importance_score(predicted_value, uncertainty, threshold=5, prediction_weight=0.7, uncertainty_weight=0.3):
+def explore_from_surface(current_point, prediction_model, correlation_model, depth_prediction_model, visited,
+                         threshold, heap):
+    new_points = explore_surrounding_points(prediction_model, current_point, search_radius=1000, num_points=100,
+                                            threshold=threshold)
+
+    add_points_to_heap(new_points, current_point, prediction_model, visited, threshold, heap)
+
+    predicted_bottom_count = correlation_model.predict([current_point])[0]
+    if predicted_bottom_count >= threshold:
+        return move_to_bottom(current_point, prediction_model, depth_prediction_model, visited, threshold, heap)
+
+    return get_next_point_from_heap(heap)
+
+
+def explore_from_bottom(current_point, prediction_model, visited,
+                        threshold, heap):
+    new_points = explore_surrounding_points(prediction_model, current_point, search_radius=1000, num_points=100,
+                                            threshold=threshold)
+
+    add_points_to_heap(new_points, current_point, prediction_model, visited, threshold, heap)
+
+    point_at_top = [current_point[0], current_point[1], 0]
+
+    if tuple(point_at_top) not in visited:
+        return move_to_top(point_at_top, current_point, prediction_model, visited, threshold, heap)
+
+    print("Both the neighbors of the bottom and the top points are low; checking neighbors of top.")
+    surrounding_top_points = explore_surrounding_points(prediction_model, point_at_top, search_radius=1000,
+                                                        num_points=100, threshold=threshold)
+    add_points_to_heap(surrounding_top_points, current_point, prediction_model, visited, threshold, heap)
+
+    if not heap:
+        return explore_randomly(data, heap)
+
+    return get_next_point_from_heap(heap)
+
+
+def add_points_to_heap(new_points, current_point, prediction_model, visited, threshold, heap):
+    for point in new_points:
+        if tuple(point) not in visited:
+            predicted_value, uncertainty = prediction_model.predict([point[:3]], return_std=True)
+            distance_cost = calculate_distance_cost(current_point, point)
+            coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + len(new_points))
+            importance = importance_score(predicted_value, uncertainty, threshold)
+            objective_value = objective_function(importance, distance_cost, coverage_factor)
+            heapq.heappush(heap, (-objective_value, tuple(point)))
+
+
+def move_to_bottom(current_point, prediction_model, depth_prediction_model, visited, threshold, heap):
+    predicted_depth = depth_prediction_model.predict([current_point[:2]])[0]
+    point_at_bottom = [current_point[0], current_point[1], predicted_depth]
+    predicted_value, uncertainty = prediction_model.predict([point_at_bottom], return_std=True)
+    importance = importance_score(predicted_value, uncertainty, threshold)
+    distance_cost = calculate_distance_cost(current_point, point_at_bottom)
+    coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + 1)
+    objective_value_at_bottom = objective_function(importance, distance_cost, coverage_factor)
+
+    if heap and -heap[0][0] > objective_value_at_bottom:
+        heapq.heappush(heap, (-objective_value_at_bottom, tuple(point_at_bottom)))
+        return heapq.heappop(heap)[1]
+
+    else:
+        return point_at_bottom
+
+
+def move_to_top(point_at_top, current_point, prediction_model, visited, threshold, heap):
+    predicted_value, uncertainty = prediction_model.predict([point_at_top], return_std=True)
+    importance = importance_score(predicted_value, uncertainty, threshold)
+    distance_cost = calculate_distance_cost(current_point, point_at_top)
+    coverage_factor = calculate_coverage_factor(visited, total_area=len(visited) + 1)
+    objective_value_at_top = objective_function(importance, distance_cost, coverage_factor)
+
+    if heap and -heap[0][0] > objective_value_at_top:
+        heapq.heappush(heap, (-objective_value_at_top, tuple(point_at_top)))
+        return heapq.heappop(heap)[1]
+    else:
+        return point_at_top
+
+
+def get_next_point_from_heap(heap):
+    if heap:
+        return heapq.heappop(heap)[1]
+    else:
+        return None
+
+
+def explore_randomly(data, heap):
+    random_point = generate_random_point(data)
+    heapq.heappush(heap, (-importance_score(0, 0), tuple(random_point)))
+    return random_point
+
+
+def importance_score(predicted_value, uncertainty, threshold=5, prediction_weight=0.8, uncertainty_weight=0.2):
     prediction_score = prediction_weight * max(predicted_value - threshold, 0)
     uncertainty_score = uncertainty_weight * uncertainty
     total_score = prediction_score + uncertainty_score
@@ -255,11 +280,11 @@ def plot_initial_data(ax, voxel_data, threshold):
     ax.legend()
 
 
-def animate_robot_movement(frame, ax, path):
-    if frame < len(path):
-        ax.plot(path[:frame + 1, 0], path[:frame + 1, 1], path[:frame + 1, 2], color='red', linewidth=2)
-        ax.scatter(path[frame, 0], path[frame, 1], path[frame, 2], color='blue', s=50,
-                   label='Robot' if frame == 0 else "")
+def animate_robot_movement(frame, path_traveled, ax):
+    if frame < len(path_traveled):
+        current_point = path_traveled[frame]
+        ax.scatter(current_point[0], current_point[1], current_point[2], color='blue', s=50)
+        ax.plot(path_traveled[:frame + 1, 0], path_traveled[:frame + 1, 1], path_traveled[:frame + 1, 2], color='red')
 
 
 def main_driver(path):
@@ -280,36 +305,44 @@ def main_driver(path):
     importance = importance_score(predicted_value[0], uncertainty[0])
     heapq.heappush(heap, (-importance, tuple(current_point)))
 
-    print(f" starting at point {current_point}")
+    print(f"Starting at point {current_point}")
 
     path_traveled = [current_point]  # To record the robot's path
 
+    iteration_limit = 30
+    iteration_count = 0
+
     while heap:
-        current_point = decide_next_move(current_point, prediction_model_instance,
-                                         correlation_model_instance, depth_prediction_model_instance,
-                                         visited, threshold=5,
-                                         explore_surrounding_points=explore_surrounding_points,
-                                         heap=heap)
+        current_point = decide_next_move(current_point, prediction_model_instance, correlation_model_instance,
+                                         depth_prediction_model_instance, visited, threshold=5, heap=heap, data=data)
 
         if current_point is None:
             print("No valid moves found.")
             break
-        elif not heap:
+
+        if not heap:
             print("Exploration complete.")
             break
-        else:
-            print(f"Now visiting {current_point}")
-            path_traveled.append(current_point)  
+
+        iteration_count += 1
+        if iteration_count > iteration_limit:
+            print("Reached iteration limit, terminating exploration.")
+            break
+
+        path_traveled.append(current_point)
 
     print("Finished exploring all points.")
 
     path_traveled = np.array(path_traveled)
 
-    fig = plt.figure()
+    # Initialize plot
+    fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
     plot_initial_data(ax, data, 5)
-    ani = FuncAnimation(fig, animate_robot_movement, frames=len(path_traveled), fargs=(ax, path_traveled),
-                        interval=500, repeat=False)
+
+    ani = FuncAnimation(fig, animate_robot_movement, frames=len(path_traveled), fargs=(path_traveled, ax), interval=500,
+                        repeat=False)
+
     plt.show()
 
 
